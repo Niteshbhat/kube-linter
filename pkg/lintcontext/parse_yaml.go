@@ -13,7 +13,7 @@ import (
 	y "github.com/ghodss/yaml"
 	ocsAppsV1 "github.com/openshift/api/apps/v1"
 	"github.com/pkg/errors"
-	"golang.stackrox.io/kube-linter/internal/k8sutil"
+	"golang.stackrox.io/kube-linter/pkg/k8sutil"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
@@ -167,25 +167,7 @@ func (l *lintContextImpl) renderTgzHelmChart(tgzFile string) (map[string]string,
 		return nil, err
 	}
 
-	valuesIndex := -1
-	for i, f := range chrt.Raw {
-		if f.Name == "values.yaml" {
-			valuesIndex = i
-			break
-		}
-	}
-
-	indexName := filepath.Join(tgzFile, "values.yaml")
-	if valuesIndex == -1 {
-		return nil, errors.Errorf("%s not found", indexName)
-	}
-
-	values, err := l.parseValues(indexName, chrt.Raw[valuesIndex].Data)
-	if err != nil {
-		return nil, errors.Wrap(err, "loading values.yaml file")
-	}
-
-	return l.renderValues(chrt, values)
+	return l.renderChart(tgzFile, chrt)
 }
 
 func (l *lintContextImpl) parseValues(filePath string, bytes []byte) (map[string]interface{}, error) {
@@ -255,4 +237,59 @@ func (l *lintContextImpl) loadObjectsFromReader(filePath string, reader io.Reade
 			return err
 		}
 	}
+}
+
+func (l *lintContextImpl) renderChart(fileName string, chart *chart.Chart) (map[string]string, error) {
+	if err := chart.Validate(); err != nil {
+		return nil, err
+	}
+
+	valuesIndex := -1
+	for i, f := range chart.Raw {
+		if f.Name == "values.yaml" {
+			valuesIndex = i
+			break
+		}
+	}
+
+	indexName := filepath.Join(fileName, "values.yaml")
+	if valuesIndex == -1 {
+		return nil, errors.Errorf("%s not found", indexName)
+	}
+
+	values, err := l.parseValues(indexName, chart.Raw[valuesIndex].Data)
+	if err != nil {
+		return nil, errors.Wrap(err, "loading values.yaml file")
+	}
+
+	return l.renderValues(chart, values)
+}
+
+func (l *lintContextImpl) renderTgzHelmChartReader(fileName string, tgzReader io.Reader) (map[string]string, error) {
+	// Helm doesn't have great logging behaviour, and can spam stderr, so silence their logging.
+	log.SetOutput(nopWriter{})
+	defer log.SetOutput(os.Stderr)
+	chrt, err := loader.LoadArchive(tgzReader)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return l.renderChart(fileName, chrt)
+}
+
+func (l *lintContextImpl) readObjectsFromTgzHelmChart(fileName string, tgzReader io.Reader) error {
+	metadata := ObjectMetadata{FilePath: fileName}
+	renderedFiles, err := l.renderTgzHelmChartReader(fileName, tgzReader)
+	if err != nil {
+		l.invalidObjects = append(l.invalidObjects, InvalidObject{Metadata: metadata, LoadErr: err})
+		return nil
+	}
+	for path, contents := range renderedFiles {
+		pathToTemplate := filepath.Join(fileName, path)
+		if err := l.loadObjectsFromReader(pathToTemplate, strings.NewReader(contents)); err != nil {
+			return errors.Wrapf(err, "loading objects from rendered helm chart %s", pathToTemplate)
+		}
+	}
+	return nil
 }
